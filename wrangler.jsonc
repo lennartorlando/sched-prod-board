@@ -1,0 +1,14 @@
+{
+  // The incident board: static assets from dist/ (built by scripts/build.mjs),
+  // plus src/media.js for /media/* only, so video players get byte ranges.
+  "name": "sched-prod-board",
+  "account_id": "dca53380dc7eb66e8bbee49060d78842",
+  "main": "src/media.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/media/*"]
+  }
+}
