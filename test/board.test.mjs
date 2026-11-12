@@ -129,6 +129,71 @@ describe('live list and refresh (SCHED-4511, SCHED-4513)', () => {
     assert.equal(await top(), before);
     await context.close();
   });
+  test('an answer without an incident list counts as a failed refresh', async () => {
+    const night = createFakeNight({ malformedCalls: new Set([2]) });
+    const { context, page } = await openBoard(night);
+    await page.getByTestId('incident-row').first().waitFor();
+    await page.getByText(/Last update failed at/).waitFor({ timeout: 6000 });
+    assert.equal(await page.getByTestId('incident-row').count(), BASE_INCIDENTS.length);
+    assert.equal(await page.getByTestId('empty').isVisible(), false);
+    await context.close();
+  });
+
+  test('rows the API drops leave the list; an empty answer shows empty', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    await page.getByTestId('incident-row').first().waitFor();
+    night.setIncidents(BASE_INCIDENTS.slice(1));
+    await page.locator('[data-testid="incident-row"][data-id="INC-2662"]').waitFor({ state: 'detached', timeout: 5000 });
+    assert.equal(await page.getByTestId('incident-row').count(), BASE_INCIDENTS.length - 1);
+    night.setIncidents([]);
+    await page.getByTestId('empty').waitFor({ timeout: 5000 });
+    assert.equal(await page.getByTestId('incident-row').count(), 0);
+    await context.close();
+  });
+
+  test('a tab coming back fetches at once, never beside a pending request', async () => {
+    const slow = createFakeNight({ delayMs: 1500 });
+    const { context, page } = await openBoard(slow);
+    await page.getByTestId('incident-row').first().waitFor();
+    const comeBack = () =>
+      page.evaluate(() => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+    await page.waitForFunction(() => true);
+    const before = slow.log.incidents.length;
+    await page.waitForTimeout(600); // the next request is now pending in its 1.5 s delay
+    await comeBack();
+    await page.waitForTimeout(3000);
+    assert.equal(slow.log.maxInFlight, 1);
+    assert.ok(slow.log.incidents.length - before <= 2, 'a visibility event must not start a second chain');
+    await context.close();
+
+    const fast = createFakeNight();
+    const second = await openBoard(fast);
+    await second.page.getByTestId('incident-row').first().waitFor();
+    await second.page.waitForTimeout(300);
+    const count = fast.log.incidents.length;
+    await second.page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await second.page.waitForTimeout(400);
+    assert.equal(fast.log.incidents.length, count + 1, 'expected one fetch right after the tab came back');
+    await second.context.close();
+  });
+
+  test('a request pending for 10 s is reported while the loader stays', async () => {
+    const night = createFakeNight({ delayMs: 11500 });
+    const { context, page } = await openBoard(night);
+    await page.getByText('Still waiting for incidents…').waitFor({ timeout: 11000 });
+    assert.equal(await page.getByTestId('loader').isVisible(), true);
+    await page.getByTestId('incident-row').first().waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.status').textContent(), '');
+    assert.equal(night.log.maxInFlight, 1);
+    await context.close();
+  });
 });
 
 describe('ack (SCHED-4511)', () => {
@@ -142,14 +207,44 @@ describe('ack (SCHED-4511)', () => {
     await row.getByTestId('acked').waitFor();
     assert.equal(night.log.acks.length, 1);
     assert.equal(night.log.acks[0].id, 'INC-4640');
-    const latestCursor = `cursor-${night.log.incidents.length - 1}`;
-    assert.equal(night.log.acks[0].cursor, latestCursor);
+    assert.equal(night.log.acks[0].cursor, night.log.acks[0].lastServed);
+    assert.notEqual(night.log.acks[0].cursor, 'cursor-0');
     assert.equal(await row.getByTestId('ack').count(), 0);
     assert.equal(await page.getByTestId('acked').count(), 1);
     night.addIncident({ id: 'INC-9002', service: 'auth', region: 'eu-west', summary: 'pushes rows down', severity: 'sev1', openedAt: '2026-11-12T03:20:00.000Z' });
     await page.locator('[data-testid="incident-row"][data-id="INC-9002"]').waitFor({ timeout: 5000 });
     assert.equal(await row.getByTestId('acked').count(), 1);
     assert.equal(await page.getByTestId('acked').count(), 1);
+    await context.close();
+  });
+
+  test('an acked incident keeps its mark when its row leaves and comes back', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    const row = page.locator('[data-testid="incident-row"][data-id="INC-4640"]');
+    await row.getByTestId('ack').click();
+    await row.getByTestId('acked').waitFor();
+    night.setIncidents(BASE_INCIDENTS.filter((i) => i.id !== 'INC-4640'));
+    await row.waitFor({ state: 'detached', timeout: 5000 });
+    night.setIncidents(BASE_INCIDENTS);
+    await row.waitFor({ timeout: 5000 });
+    assert.equal(await row.getByTestId('acked').count(), 1);
+    assert.equal(await row.getByTestId('ack').count(), 0);
+    assert.equal(night.log.acks.length, 1);
+    await context.close();
+  });
+
+  test('after a failed ack, a second click acks and clears the error', async () => {
+    const night = createFakeNight({ failAck: true });
+    const { context, page } = await openBoard(night);
+    const row = page.locator('[data-testid="incident-row"][data-id="INC-1778"]');
+    await row.getByTestId('ack').click();
+    await row.getByRole('alert').waitFor();
+    night.failAck = false;
+    await row.getByTestId('ack').click();
+    await row.getByTestId('acked').waitFor();
+    assert.equal(await row.getByRole('alert').count(), 0);
+    assert.equal(night.log.acks.length, 2);
     await context.close();
   });
 
@@ -161,6 +256,9 @@ describe('ack (SCHED-4511)', () => {
     await row.getByRole('alert').waitFor();
     assert.equal(await row.getByTestId('ack').isEnabled(), true);
     assert.equal(await page.getByTestId('acked').count(), 0);
+    await row.getByTestId('ack').click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-testid="ack"]:disabled').length === 0);
+    assert.equal(await row.getByRole('alert').count(), 1, 'a second failure replaces the note, never stacks it');
     await context.close();
   });
 });

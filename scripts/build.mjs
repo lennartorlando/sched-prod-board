@@ -1,29 +1,36 @@
 // Builds dist/ from app/: stamps the commit sha into the page and writes config.js.
 // The session reaches only the built config.js, never git.
 //
-// usage: node scripts/build.mjs --sha <40 hex> --api <https url> --session-file <path> [--out <dir>]
+// usage: node scripts/build.mjs --sha <40 hex> --session-file <path> [--api <https url>] [--out <dir>]
 import { cpSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parseArgs } from 'node:util';
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const COURSE_API = 'https://hq.mega.dev/challenges/show-me-when/api';
 export const SHA_PLACEHOLDER = '__BUILD_SHA__';
 
-export function readSession(file) {
-  const value = readFileSync(file, 'utf8').trim();
+export function assertSession(value, source = 'session') {
   if (!value || /\s/.test(value) || value.includes('<')) {
-    throw new Error(`build: ${file} does not hold a session (empty, several lines or a placeholder)`);
+    throw new Error(`build: ${source} is empty, spans several lines or is a placeholder`);
   }
+  return value;
+}
+
+// A real course session, as start-challenge hands it out (v1.<payload>.<signature>).
+export function readSession(file) {
+  const value = assertSession(readFileSync(file, 'utf8').trim(), file);
+  if (!/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) throw new Error(`build: ${file} does not hold a course session`);
   return value;
 }
 
 export function build({ sha, api, session, outDir, appDir = join(REPO, 'app') }) {
   if (!/^[0-9a-f]{40}$/.test(sha ?? '')) throw new Error('build: sha must be a full 40-character git sha');
   if (!/^https:\/\/\S+$/.test(api ?? '')) throw new Error('build: api must be an https URL');
-  if (!session || /\s/.test(session) || session.includes('<')) throw new Error('build: missing or placeholder session');
+  assertSession(session);
 
-  const indexPath = join(appDir, 'index.html');
-  const index = readFileSync(indexPath, 'utf8');
+  const index = readFileSync(join(appDir, 'index.html'), 'utf8');
   const slots = index.split(SHA_PLACEHOLDER).length - 1;
   if (slots !== 2) throw new Error(`build: expected 2 build sha slots in index.html, found ${slots}`);
 
@@ -39,15 +46,11 @@ export function build({ sha, api, session, outDir, appDir = join(REPO, 'app') })
   return outDir;
 }
 
-function args(argv) {
-  const out = {};
-  for (let i = 0; i < argv.length; i += 2) out[argv[i].replace(/^--/, '')] = argv[i + 1];
-  return out;
-}
-
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const a = args(process.argv.slice(2));
-  const outDir = resolve(a.out ?? join(REPO, 'dist'));
-  build({ sha: a.sha, api: a.api, session: readSession(a['session-file']), outDir });
-  console.log(`built ${outDir} for ${a.sha}`);
+  const { values } = parseArgs({
+    options: { sha: { type: 'string' }, api: { type: 'string', default: COURSE_API }, 'session-file': { type: 'string' }, out: { type: 'string', default: join(REPO, 'dist') } },
+  });
+  const outDir = resolve(values.out);
+  build({ sha: values.sha, api: values.api, session: readSession(values['session-file']), outDir });
+  console.log(`built ${outDir} for ${values.sha}`);
 }

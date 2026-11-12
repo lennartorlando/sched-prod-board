@@ -57,3 +57,14 @@ test('a missing file keeps the assets 404', async () => {
   const res = await get('/media/nope.mp4', { range: 'bytes=0-1' });
   assert.equal(res.status, 404);
 });
+
+test('If-Range with the current ETag keeps the range', async () => {
+  const res = await get('/media/clip.mp4', { range: 'bytes=0-1', 'if-range': '"v1"' });
+  assert.equal(res.status, 206);
+});
+
+test('If-Range with an old ETag answers the whole current file', async () => {
+  const res = await get('/media/clip.mp4', { range: 'bytes=2-', 'if-range': '"old-video"' });
+  assert.equal(res.status, 200);
+  assert.equal((await res.arrayBuffer()).byteLength, 10);
+});

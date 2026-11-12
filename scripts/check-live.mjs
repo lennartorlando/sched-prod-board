@@ -2,13 +2,12 @@
 // Never prints the session.
 //
 // usage: node scripts/check-live.mjs <board url> [--sha <40 hex>] [--media </media/file.mp4>]
-const [url, ...rest] = process.argv.slice(2);
-const opt = (name) => {
-  const i = rest.indexOf(`--${name}`);
-  return i >= 0 ? rest[i + 1] : undefined;
-};
-const base = new URL(url);
-const API = 'https://hq.mega.dev/challenges/show-me-when/api';
+import { parseArgs } from 'node:util';
+import { COURSE_API } from './build.mjs';
+
+const { values, positionals } = parseArgs({ allowPositionals: true, options: { sha: { type: 'string' }, media: { type: 'string' } } });
+const opt = (name) => values[name];
+const base = new URL(positionals[0]);
 let failed = 0;
 
 function check(name, ok, detail = '') {
@@ -35,7 +34,7 @@ for (const hook of ['board', 'loader', 'empty', 'incident-list']) {
 const config = await get('/config.js');
 const configText = await config.text();
 check('config.js answers 200', config.status === 200, String(config.status));
-check('config.js names the course API', configText.includes(JSON.stringify(API)));
+check('config.js names the course API', configText.includes(JSON.stringify(COURSE_API)));
 check('config.js holds a session, not the placeholder', /SESSION = "v1\.[^"\s<]+"/.test(configText));
 
 for (const path of ['/app.js', '/api.js', '/style.css']) {

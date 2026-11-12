@@ -7,9 +7,9 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { REPO, build, readSession } from './build.mjs';
+import { parseArgs } from 'node:util';
+import { COURSE_API, REPO, build, readSession } from './build.mjs';
 
-const API = 'https://hq.mega.dev/challenges/show-me-when/api';
 const BOARD_URL = process.env.BOARD_URL ?? 'https://sched-prod-board.orlando-x.workers.dev';
 const SESSION_FILE = resolve(process.env.SESSION_FILE ?? join(REPO, '..', 'private', 'session.txt'));
 const PROVE_SHA256 = 'bc0bbd32e1227260d51e4746a9213f311f5353d2a5c486b061d39cf7dfd427f7';
@@ -21,8 +21,8 @@ const fail = (message) => {
   process.exit(1);
 };
 
-const mediaIndex = process.argv.indexOf('--media');
-const mediaDir = mediaIndex > 0 ? resolve(process.argv[mediaIndex + 1]) : null;
+const { values } = parseArgs({ options: { media: { type: 'string' } } });
+const mediaDir = values.media ? resolve(values.media) : null;
 
 if (git('status', '--porcelain')) fail('the working tree is not clean; commit first, so the sha names what ships');
 const prove = createHash('sha256').update(readFileSync(join(REPO, '.github/workflows/prove.yml'))).digest('hex');
@@ -30,7 +30,7 @@ if (prove !== PROVE_SHA256) fail('.github/workflows/prove.yml differs from the s
 
 const sha = git('rev-parse', 'HEAD');
 const dist = join(REPO, 'dist');
-build({ sha, api: API, session: readSession(SESSION_FILE), outDir: dist });
+build({ sha, api: COURSE_API, session: readSession(SESSION_FILE), outDir: dist });
 
 if (mediaDir) {
   mkdirSync(join(dist, 'media'), { recursive: true });

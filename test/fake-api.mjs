@@ -20,9 +20,12 @@ const SERVICES = ['payments', 'exports', 'auth', 'reminders'];
 /**
  * options:
  *   incidents     starting list, newest first (default BASE_INCIDENTS)
- *   arrivalEveryMs  add a new incident at the top this often, counted from the first incidents call
+ *   arrivalEveryMs  add a new incident at the top this often, counted from the first call that
+ *                 carries the cursor of the previous answer; like the real API, a call without
+ *                 the latest cursor (a reload, a broken chain) brings no arrivals
  *   delayMs       delay every incidents answer
  *   failCalls     set of incidents call numbers (0-based) that answer 500
+ *   malformedCalls  set of incidents call numbers that answer 200 without an incidents list
  *   failAck       ack answers 500
  */
 export function createFakeNight(options = {}) {
@@ -32,6 +35,7 @@ export function createFakeNight(options = {}) {
   let calls = 0;
   let firstCallAt = null;
   let arrivals = 0;
+  let lastServed = null;
 
   function addIncident(incident) {
     incidents = [incident, ...incidents];
@@ -60,27 +64,36 @@ export function createFakeNight(options = {}) {
       const n = calls++;
       inFlight += 1;
       log.maxInFlight = Math.max(log.maxInFlight, inFlight);
-      const now = Date.now();
-      if (firstCallAt === null) firstCallAt = now;
-      log.incidents.push({ at: now, since: url.searchParams.get('since'), t: url.searchParams.get('t') });
-      if (options.delayMs) await new Promise((done) => setTimeout(done, options.delayMs));
-      arrive(Date.now());
-      inFlight -= 1;
-      if (options.failCalls?.has(n)) {
-        await route.fulfill({ status: 500, headers, contentType: 'text/plain', body: 'fake failure' });
-        return;
+      const since = url.searchParams.get('since');
+      const chained = since !== null && since === lastServed;
+      if (chained && firstCallAt === null) firstCallAt = Date.now();
+      log.incidents.push({ at: Date.now(), since, chained, t: url.searchParams.get('t') });
+      try {
+        if (options.delayMs) await new Promise((done) => setTimeout(done, options.delayMs));
+        if (chained) arrive(Date.now());
+        if (options.failCalls?.has(n)) {
+          await route.fulfill({ status: 500, headers, contentType: 'text/plain', body: 'fake failure' });
+          return;
+        }
+        if (options.malformedCalls?.has(n)) {
+          await route.fulfill({ status: 200, headers, contentType: 'application/json', body: JSON.stringify({ updatedAt: new Date().toISOString() }) });
+          return;
+        }
+        lastServed = `cursor-${n}`;
+        await route.fulfill({
+          status: 200,
+          headers,
+          contentType: 'application/json',
+          body: JSON.stringify({ updatedAt: new Date().toISOString(), incidents, cursor: lastServed }),
+        });
+      } finally {
+        inFlight -= 1;
       }
-      await route.fulfill({
-        status: 200,
-        headers,
-        contentType: 'application/json',
-        body: JSON.stringify({ updatedAt: new Date().toISOString(), incidents, cursor: `cursor-${n}` }),
-      });
       return;
     }
     if (url.pathname.endsWith('/ack')) {
       const id = url.searchParams.get('id');
-      log.acks.push({ at: Date.now(), id, cursor: url.searchParams.get('cursor') });
+      log.acks.push({ at: Date.now(), id, cursor: url.searchParams.get('cursor'), lastServed });
       if (options.failAck) {
         await route.fulfill({ status: 500, headers, contentType: 'text/plain', body: 'fake ack failure' });
         return;

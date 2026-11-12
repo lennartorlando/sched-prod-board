@@ -3,13 +3,19 @@
 // run record of every moment (offsets from the video's start) and every ack reply.
 //
 // usage:
-//   node scripts/record.mjs --rehearse --out <dir>     local build + fake API; sends nothing to the course
-//   node scripts/record.mjs --live <board url> --out <dir>   real board; sends two real acks
+//   node scripts/record.mjs --rehearse [--fail-shift-ack] [--out <dir>] [--private <dir>]
+//       local build + fake API; sends nothing to the course
+//   node scripts/record.mjs --live <board url> [--out <dir>] [--private <dir>]
+//       the real board; sends two real acks
 //
-// The pointer and the click ring in the video are drawn by this script, not by the board.
+// --out gets the shareable files (step1.mp4, stills, run.masked.json); --private gets the full
+// run record and every ack reply the moment it arrives (acks.jsonl). Neither folder may exist
+// with files in it; nothing is ever deleted. The pointer and the click ring in the video are
+// drawn by this script, not by the board.
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { parseArgs } from 'node:util';
 import { chromium } from 'playwright';
 import { REPO, build } from './build.mjs';
 import { serveDir } from './lib/static-server.mjs';
@@ -19,20 +25,46 @@ const VIEW = { width: 1280, height: 1080 };
 const MAIN = { name: 'main', locale: 'en-NZ', timezoneId: 'Pacific/Auckland' };
 const SECOND = { name: 'berlin', locale: 'de-DE', timezoneId: 'Europe/Berlin' };
 const STABLE_ID = 'INC-4925'; // the one openedAt that does not move between page loads
+const REST_AFTER_ARRIVAL_MS = 6500; // arrivals come every 8 to 11 s; rest the pointer before the next
 
-const argv = process.argv.slice(2);
-const rehearse = argv.includes('--rehearse');
-const liveUrl = argv.includes('--live') ? argv[argv.indexOf('--live') + 1] : null;
-const outDir = resolve(argv[argv.indexOf('--out') + 1] ?? 'recordings');
-if (!rehearse && !liveUrl) throw new Error('record: pass --rehearse or --live <url>');
-rmSync(outDir, { recursive: true, force: true });
-mkdirSync(join(outDir, 'stills'), { recursive: true });
+const { values } = parseArgs({
+  options: {
+    rehearse: { type: 'boolean', default: false },
+    live: { type: 'string' },
+    out: { type: 'string' },
+    private: { type: 'string' },
+    'fail-shift-ack': { type: 'boolean', default: false },
+  },
+});
+if (values.rehearse === Boolean(values.live)) throw new Error('record: pass exactly one of --rehearse or --live <url>');
+if (values['fail-shift-ack'] && !values.rehearse) throw new Error('record: --fail-shift-ack is for rehearsals only');
+const mode = values.rehearse ? 'rehearsal' : 'live';
+const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+const outDir = resolve(values.out ?? join(REPO, 'recordings', `${mode}-${stamp}`));
+const privateDir = resolve(values.private ?? (values.rehearse ? join(outDir, 'private') : join(REPO, '..', 'private', 'recordings', `${mode}-${stamp}`)));
+for (const dir of [outDir, privateDir]) {
+  if (existsSync(dir) && readdirSync(dir).length > 0) throw new Error(`record: ${dir} already holds files; pick a new folder`);
+}
+for (const dir of [join(outDir, 'stills'), join(outDir, 'parts'), privateDir]) mkdirSync(dir, { recursive: true });
 
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const mmss = (ms) => {
   const s = Math.floor(ms / 1000);
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
+const maskReceipt = (value) => (typeof value === 'string' ? `${value.slice(0, 6)}…` : value);
+
+// The run record: full in privateDir, masked in outDir, saved after every ack and on any exit.
+const run = { mode, startedAt: new Date().toISOString(), takes: {} };
+const receipts = new Set();
+function save() {
+  writeFileSync(join(privateDir, 'run.json'), JSON.stringify(run, null, 2));
+  const masked = JSON.stringify(run, (key, value) => (key === 'receipt' ? maskReceipt(value) : value), 2);
+  for (const receipt of receipts) {
+    if (masked.includes(receipt)) throw new Error('record: a full receipt reached the masked record');
+  }
+  writeFileSync(join(outDir, 'run.masked.json'), masked);
+}
 
 // Recording-only overlay: a pointer that follows the mouse, a ring on each press, and an
 // observer that reports every change of the top row to this script.
@@ -81,138 +113,162 @@ function overlay() {
 }
 
 async function take(browser, spec, url, { fake, main }) {
-  const dir = join(outDir, spec.name);
+  const record = { ...spec, events: [], acks: [], consoleAcks: [], courseCalls: [] };
+  run.takes[spec.name] = record;
   const context = await browser.newContext({
     locale: spec.locale,
     timezoneId: spec.timezoneId,
     viewport: VIEW,
-    recordVideo: { dir, size: VIEW },
+    recordVideo: { dir: join(outDir, 'parts', spec.name), size: VIEW },
   });
-  const record = { ...spec, events: [], acks: [], consoleAcks: [], courseCalls: [] };
-  if (fake) {
-    await fake.install(context);
-    await context.route('https://hq.mega.dev/**', (route) => {
-      record.courseCalls.push(route.request().url().replace(/([?&]t=)[^&]+/, '$1<masked>'));
-      return route.abort();
-    });
-  }
-  let t0 = 0;
-  const waiters = [];
-  const at = () => Date.now() - t0;
-  const mark = (type, extra = {}) => {
-    const event = { t: at(), type, ...extra };
-    record.events.push(event);
-    console.log(`${spec.name} ${mmss(event.t)} ${type} ${JSON.stringify(extra)}`);
-    return event;
-  };
-  await context.exposeBinding('__recEvent', (_source, ev) => {
-    const event = mark(ev.prev ? 'arrival' : 'first-top', { id: ev.id, prev: ev.prev });
-    waiters.splice(0).forEach((resolveWaiter) => resolveWaiter(event));
-  });
-  await context.addInitScript(overlay);
-
-  const page = await context.newPage();
-  t0 = Date.now();
-  record.t0 = new Date(t0).toISOString();
-  page.on('response', async (res) => {
-    if (!/\/ack\?/.test(res.url())) return;
-    const t = at();
-    try {
-      record.acks.push({ t, status: res.status(), reply: await res.json() });
-    } catch {
-      record.acks.push({ t, status: res.status(), reply: null });
-    }
-  });
-  page.on('console', (msg) => {
-    if (msg.type() === 'info' && msg.text().startsWith('ack ')) {
-      const [, id, ackedAt, receipt] = msg.text().split(' ');
-      record.consoleAcks.push({ t: at(), id, ackedAt, receipt });
-    }
-  });
-  const nextArrival = (timeout = 30000) =>
-    new Promise((resolveWaiter, reject) => {
-      const timer = setTimeout(() => reject(new Error('no arrival in time')), timeout);
-      waiters.push((event) => {
-        clearTimeout(timer);
-        resolveWaiter(event);
+  let page;
+  try {
+    if (fake) {
+      await fake.install(context);
+      await context.route('https://hq.mega.dev/**', (route) => {
+        record.courseCalls.push(route.request().url().replace(/([?&]t=)[^&]+/, '$1<masked>'));
+        return route.abort();
       });
-    });
-
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-  mark('page', { loaderVisible: await page.getByTestId('loader').isVisible() });
-  await page.getByTestId('incident-row').first().waitFor({ timeout: 15000 });
-  const baseIds = await page.getByTestId('incident-row').evaluateAll((rows) => rows.map((r) => r.dataset.id));
-  mark('first-rows', { count: baseIds.length, loaderVisible: await page.getByTestId('loader').isVisible() });
-  record.sha = await page.locator('meta[name="build"]').getAttribute('content');
-  const stable = page.locator(`[data-testid="incident-row"][data-id="${STABLE_ID}"] time`);
-  if (await stable.count()) {
-    record.stable = { id: STABLE_ID, t: at(), text: (await stable.textContent()).trim(), datetime: await stable.getAttribute('datetime') };
-    mark('stable-row', record.stable);
-  }
-
-  if (!main) {
-    await sleep(12000);
-  } else {
-    // Watch two arrivals.
-    await nextArrival();
-    await nextArrival();
-
-    // Clean ack: a locator click, which waits for the row to hold still and targets it by id.
-    await sleep(1200);
-    const cleanId = await page.getByTestId('incident-row').first().getAttribute('data-id');
-    const cleanButton = page.locator(`[data-testid="incident-row"][data-id="${cleanId}"] [data-testid="ack"]`);
-    const cb = await cleanButton.boundingBox();
-    await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 20 });
-    mark('clean-click', { id: cleanId });
-    await cleanButton.click();
-    await page.locator(`[data-testid="incident-row"][data-id="${cleanId}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
-    mark('clean-acked', { id: cleanId });
-
-    // Ack under a shift: rest the pointer on the newest row's Ack, then click those same
-    // screen coordinates just after the next incident lands on top.
-    let shift = null;
-    for (let attempt = 1; attempt <= 3 && !shift; attempt += 1) {
-      const anchor = await nextArrival();
-      await sleep(Math.max(0, 6500 - (at() - anchor.t)));
-      const intended = await page.getByTestId('incident-row').first().getAttribute('data-id');
-      const button = page.locator(`[data-testid="incident-row"][data-id="${intended}"] [data-testid="ack"]`);
-      const box = await button.boundingBox();
-      const x = Math.round(box.x + box.width / 2);
-      const y = Math.round(box.y + box.height / 2);
-      await page.mouse.move(x, y, { steps: 20 });
-      const underAtRest = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('[data-testid="incident-row"]')?.dataset.id, [x, y]);
-      const rest = mark('pointer-rests', { intended, underPointer: underAtRest, x, y });
-      const arrival = await nextArrival(20000);
-      await sleep(120);
-      const underAtClick = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('[data-testid="incident-row"]')?.dataset.id, [x, y]);
-      if (underAtClick === intended) {
-        mark('shift-missed', { intended, underAtClick });
-        continue;
-      }
-      const footer = await page.getByTestId('build-sha').boundingBox();
-      const click = mark('shift-click', { intended, underPointer: underAtClick, arrival: arrival.id, msAfterArrival: at() - arrival.t, footerOnScreen: !!footer && footer.y + footer.height <= VIEW.height });
-      const acksBefore = record.acks.length;
-      await page.mouse.click(x, y);
-      await page.locator(`[data-testid="incident-row"][data-id="${underAtClick}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
-      const acked = mark('shift-acked', { id: underAtClick });
-      const reply = record.acks.slice(acksBefore).find((a) => a.reply)?.reply ?? null;
-      shift = { intended, ackedId: reply?.id ?? null, arrival: arrival.id, restT: rest.t, arrivalT: arrival.t, clickT: click.t, ackedT: acked.t, footerOnScreen: click.footerOnScreen };
     }
-    record.shift = shift;
-    record.clean = { id: cleanId, ...record.events.find((e) => e.type === 'clean-acked') };
+    let t0 = 0;
+    const waiters = [];
+    const at = () => Date.now() - t0;
+    const mark = (type, extra = {}) => {
+      const event = { t: at(), type, ...extra };
+      record.events.push(event);
+      console.log(`${spec.name} ${mmss(event.t)} ${type} ${JSON.stringify(extra)}`);
+      return event;
+    };
+    await context.exposeBinding('__recEvent', (_source, ev) => {
+      const event = mark(ev.prev ? 'arrival' : 'first-top', { id: ev.id, prev: ev.prev });
+      waiters.splice(0).forEach((resolveWaiter) => resolveWaiter(event));
+    });
+    await context.addInitScript(overlay);
 
-    // Keep watching: arrivals continue, marks stay, no reload.
-    await sleep(30000);
-    record.after = await page.evaluate(() => ({
-      rows: document.querySelectorAll('[data-testid="incident-row"]').length,
-      acked: [...document.querySelectorAll('[data-testid="acked"]')].map((m) => m.closest('[data-testid="incident-row"]').dataset.id),
-    }));
-    mark('watch-end', record.after);
+    page = await context.newPage();
+    t0 = Date.now();
+    record.t0 = new Date(t0).toISOString();
+    // Every ack reply is written to disk the moment it is read, whatever happens later.
+    page.on('response', async (res) => {
+      if (!/\/ack\?/.test(res.url())) return;
+      const t = at();
+      const body = await res.text().catch(() => '');
+      let reply = null;
+      try {
+        reply = JSON.parse(body);
+      } catch {}
+      if (typeof reply?.receipt === 'string') receipts.add(reply.receipt);
+      const entry = { take: spec.name, t, status: res.status(), reply, body: reply ? undefined : body.slice(0, 500) };
+      record.acks.push(entry);
+      appendFileSync(join(privateDir, 'acks.jsonl'), `${JSON.stringify(entry)}\n`);
+      console.log(`${spec.name} ${mmss(t)} ack-reply ${res.status()} ${reply?.id ?? '-'} ${maskReceipt(reply?.receipt) ?? '-'}`);
+      save();
+    });
+    page.on('console', (msg) => {
+      if (msg.type() === 'info' && msg.text().startsWith('ack ')) {
+        const [, id, ackedAt, receipt] = msg.text().split(' ');
+        if (receipt) receipts.add(receipt);
+        record.consoleAcks.push({ t: at(), id, ackedAt, receipt });
+      }
+    });
+    const nextArrival = (timeout = 30000) =>
+      new Promise((resolveWaiter, reject) => {
+        const timer = setTimeout(() => reject(new Error('no arrival in time')), timeout);
+        waiters.push((event) => {
+          clearTimeout(timer);
+          resolveWaiter(event);
+        });
+      });
+    const ackReply = () => page.waitForResponse((res) => /\/ack\?/.test(res.url()), { timeout: 15000 });
+    const rowAt = (x, y) =>
+      page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('[data-testid="incident-row"]')?.dataset.id ?? null, [x, y]);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    mark('page', { loaderVisible: await page.getByTestId('loader').isVisible() });
+    await page.getByTestId('incident-row').first().waitFor({ timeout: 15000 });
+    const baseIds = await page.getByTestId('incident-row').evaluateAll((rows) => rows.map((r) => r.dataset.id));
+    mark('first-rows', { count: baseIds.length, loaderVisible: await page.getByTestId('loader').isVisible() });
+    record.sha = await page.locator('meta[name="build"]').getAttribute('content');
+    const stable = page.locator(`[data-testid="incident-row"][data-id="${STABLE_ID}"] time`);
+    if (await stable.count()) {
+      record.stable = { id: STABLE_ID, t: at(), text: (await stable.textContent()).trim(), datetime: await stable.getAttribute('datetime') };
+      mark('stable-row', record.stable);
+    }
+
+    if (!main) {
+      await sleep(12000);
+    } else {
+      // Watch two arrivals.
+      await nextArrival();
+      await nextArrival();
+
+      // Clean ack: a locator click, which waits for the row to hold still and targets it by id.
+      await sleep(1200);
+      const cleanId = await page.getByTestId('incident-row').first().getAttribute('data-id');
+      const cleanButton = page.locator(`[data-testid="incident-row"][data-id="${cleanId}"] [data-testid="ack"]`);
+      const cb = await cleanButton.boundingBox();
+      await page.mouse.move(cb.x + cb.width / 2, cb.y + cb.height / 2, { steps: 20 });
+      const cleanReply = ackReply();
+      mark('clean-click', { id: cleanId });
+      await cleanButton.click();
+      const cleanRes = await cleanReply;
+      const cleanAck = await cleanRes.json().catch(() => null);
+      await page.locator(`[data-testid="incident-row"][data-id="${cleanId}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
+      record.clean = { id: cleanId, ackedId: cleanAck?.id ?? null, status: cleanRes.status(), ...mark('clean-acked', { id: cleanId, ackedId: cleanAck?.id ?? null }) };
+
+      // Ack under a shift: rest the pointer on the newest row's Ack, then click those same
+      // screen coordinates just after the next incident lands on top.
+      for (let attempt = 1; attempt <= 3 && !record.shift; attempt += 1) {
+        const anchor = await nextArrival();
+        await sleep(Math.max(0, REST_AFTER_ARRIVAL_MS - (at() - anchor.t)));
+        const intended = await page.getByTestId('incident-row').first().getAttribute('data-id');
+        const box = await page.locator(`[data-testid="incident-row"][data-id="${intended}"] [data-testid="ack"]`).boundingBox();
+        const x = Math.round(box.x + box.width / 2);
+        const y = Math.round(box.y + box.height / 2);
+        const waitArrival = nextArrival(20000); // registered before the move, so no arrival is missed
+        await page.mouse.move(x, y, { steps: 20 });
+        const restedOn = await rowAt(x, y);
+        const rest = mark('pointer-rests', { intended, restedOn, x, y });
+        if (restedOn !== intended) {
+          mark('rest-moved', { intended, restedOn });
+          await waitArrival.catch(() => {});
+          continue;
+        }
+        const arrival = await waitArrival;
+        await sleep(120);
+        const underAtClick = await rowAt(x, y);
+        if (underAtClick === intended) {
+          mark('shift-missed', { intended, underAtClick });
+          continue;
+        }
+        const footer = await page.getByTestId('build-sha').boundingBox();
+        if (values['fail-shift-ack']) fake.failAck = true;
+        const reply = ackReply();
+        const click = mark('shift-click', { intended, underPointer: underAtClick, arrival: arrival.id, msAfterArrival: at() - arrival.t, footerOnScreen: !!footer && footer.y + footer.height <= VIEW.height });
+        await page.mouse.click(x, y);
+        const res = await reply;
+        const shiftAck = await res.json().catch(() => null);
+        if (!res.ok()) throw new Error(`record: the shift ack answered ${res.status()}`);
+        await page.locator(`[data-testid="incident-row"][data-id="${underAtClick}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
+        const acked = mark('shift-acked', { id: underAtClick, ackedId: shiftAck?.id ?? null });
+        record.shift = { intended, restedOn, underPointer: underAtClick, ackedId: shiftAck?.id ?? null, arrival: arrival.id, restT: rest.t, arrivalT: arrival.t, clickT: click.t, ackedT: acked.t, footerOnScreen: click.footerOnScreen };
+        save();
+      }
+
+      // Keep watching: arrivals continue, marks stay, no reload.
+      await sleep(30000);
+      record.after = await page.evaluate(() => ({
+        rows: document.querySelectorAll('[data-testid="incident-row"]').length,
+        acked: [...document.querySelectorAll('[data-testid="acked"]')].map((m) => m.closest('[data-testid="incident-row"]').dataset.id),
+      }));
+      mark('watch-end', record.after);
+    }
+    mark('end');
+  } finally {
+    await context.close(); // finalizes the video even when a step threw
+    record.webm = page ? await page.video()?.path() : null;
+    save();
   }
-
-  mark('end');
-  await context.close();
-  record.webm = await page.video().path();
   return record;
 }
 
@@ -221,24 +277,26 @@ async function scrollProbe(browser, url) {
   const many = Array.from({ length: 30 }, (_, i) => ({ ...BASE_INCIDENTS[i % BASE_INCIDENTS.length], id: `INC-${5000 + i}` }));
   const fake = createFakeNight({ incidents: many, arrivalEveryMs: 3000 });
   const context = await browser.newContext({ viewport: VIEW });
-  await fake.install(context);
-  await context.route('https://hq.mega.dev/**', (route) => route.abort());
-  const page = await context.newPage();
-  await page.goto(url);
-  await page.getByTestId('incident-row').first().waitFor();
-  const probe = async (scrollY) => {
-    await page.evaluate((y) => window.scrollTo(0, y), scrollY);
-    await sleep(300);
-    const row = page.locator('[data-testid="incident-row"][data-id="INC-5010"]');
-    const before = (await row.boundingBox()).y;
-    const count = await page.getByTestId('incident-row').count();
-    await page.waitForFunction((n) => document.querySelectorAll('[data-testid="incident-row"]').length > n, count, { timeout: 10000 });
-    await sleep(100);
-    return { scrollY, moved: Math.round((await row.boundingBox()).y - before) };
-  };
-  const result = [await probe(0), await probe(300)];
-  await context.close();
-  return result;
+  try {
+    await fake.install(context);
+    await context.route('https://hq.mega.dev/**', (route) => route.abort());
+    const page = await context.newPage();
+    await page.goto(url);
+    await page.getByTestId('incident-row').first().waitFor();
+    const probe = async (scrollY) => {
+      await page.evaluate((y) => window.scrollTo(0, y), scrollY);
+      await sleep(300);
+      const row = page.locator('[data-testid="incident-row"][data-id="INC-5010"]');
+      const before = (await row.boundingBox()).y;
+      const count = await page.getByTestId('incident-row').count();
+      await page.waitForFunction((n) => document.querySelectorAll('[data-testid="incident-row"]').length > n, count, { timeout: 10000 });
+      await sleep(100);
+      return { scrollY, moved: Math.round((await row.boundingBox()).y - before) };
+    };
+    return [await probe(0), await probe(300)];
+  } finally {
+    await context.close();
+  }
 }
 
 function ffmpeg(args) {
@@ -257,72 +315,66 @@ function still(video, ms, name) {
 
 const browser = await chromium.launch();
 let server = null;
-let url = liveUrl;
-let fake = null;
-if (rehearse) {
-  const dist = join(REPO, 'dist-rehearsal');
-  const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO, encoding: 'utf8' }).trim();
-  build({ sha, api: FAKE_API, session: 'rehearsal-session', outDir: dist });
-  server = await serveDir(dist);
-  url = server.url;
-}
-
-const run = { mode: rehearse ? 'rehearsal' : 'live', url, startedAt: new Date().toISOString(), takes: {} };
+let url = values.live;
 try {
-  fake = rehearse ? createFakeNight({ arrivalEveryMs: 9000 }) : null;
-  run.takes.main = await take(browser, MAIN, url, { fake, main: true });
-  const fakeSecond = rehearse ? createFakeNight({ arrivalEveryMs: 9000 }) : null;
-  run.takes.berlin = await take(browser, SECOND, url, { fake: fakeSecond, main: false });
-  if (rehearse) run.scrollAnchoring = await scrollProbe(browser, url);
+  let fake = null;
+  let fakeSecond = null;
+  if (values.rehearse) {
+    const dist = join(REPO, 'dist-rehearsal');
+    const sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO, encoding: 'utf8' }).trim();
+    build({ sha, api: FAKE_API, session: 'rehearsal-session', outDir: dist });
+    server = await serveDir(dist);
+    url = server.url;
+    fake = createFakeNight({ arrivalEveryMs: 9000 });
+    fakeSecond = createFakeNight({ arrivalEveryMs: 9000 });
+  }
+  run.url = url;
+  await take(browser, MAIN, url, { fake, main: true });
+  await take(browser, SECOND, url, { fake: fakeSecond, main: false });
+  if (values.rehearse) run.scrollAnchoring = await scrollProbe(browser, url);
 } finally {
   await browser.close();
   await server?.close();
+  save();
 }
 
 // Video: each take to H.264, then joined, main first, index at the front.
 const parts = [];
 for (const name of ['main', 'berlin']) {
-  const mp4 = join(outDir, `${name}.mp4`);
+  const mp4 = join(outDir, 'parts', `${name}.mp4`);
   ffmpeg(['-i', run.takes[name].webm, '-vf', 'setpts=PTS-STARTPTS', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-preset', 'medium', '-an', mp4]);
   run.takes[name].mp4 = probe(mp4);
   parts.push(mp4);
 }
-const list = join(outDir, 'parts.txt');
+const list = join(outDir, 'parts', 'parts.txt');
 writeFileSync(list, parts.map((p) => `file '${p}'`).join('\n') + '\n');
 const final = join(outDir, 'step1.mp4');
 ffmpeg(['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', final]);
 run.video = { file: final, ...probe(final), bytes: statSync(final).size };
 
 const main = run.takes.main;
-const berlinStart = Math.round(main.mp4.duration * 1000);
 run.stills = {};
 if (main.clean?.t) run.stills.clean = still(final, main.clean.t + 400, 'clean-acked');
 if (main.shift) {
   run.stills.rest = still(final, main.shift.arrivalT - 300, 'shift-rest');
-  run.stills.click = still(final, main.shift.clickT, 'shift-click');
+  run.stills.click = still(final, main.shift.clickT + 150, 'shift-click');
   run.stills.acked = still(final, main.shift.ackedT + 400, 'shift-acked');
-  run.evidence = {
-    at: mmss(main.shift.ackedT + 999), // first whole second with the mark on screen
-    intended: main.shift.intended,
-    acked: main.shift.ackedId,
-  };
-  run.stills.at = still(final, (Math.floor((main.shift.ackedT + 999) / 1000)) * 1000, 'evidence-at');
+  const atMs = Math.floor((main.shift.ackedT + 999) / 1000) * 1000; // first whole second with the mark on screen
+  run.evidence = { at: mmss(atMs), intended: main.shift.intended, acked: main.shift.ackedId };
+  run.stills.at = still(final, atMs, 'evidence-at');
 }
 if (main.stable) run.stills.stableMain = still(final, main.stable.t + 500, 'stable-auckland');
-if (run.takes.berlin.stable) {
-  run.takes.berlin.stable.tInVideo = berlinStart + run.takes.berlin.stable.t;
-  run.stills.stableBerlin = still(final, run.takes.berlin.stable.tInVideo + 500, 'stable-berlin');
+const berlin = run.takes.berlin;
+if (berlin.stable) {
+  berlin.stable.tInVideo = Math.round(main.mp4.duration * 1000) + berlin.stable.t;
+  run.stills.stableBerlin = still(final, berlin.stable.tInVideo + 500, 'stable-berlin');
 }
+save();
 
-writeFileSync(join(outDir, 'run.json'), JSON.stringify(run, null, 2));
-const masked = JSON.parse(JSON.stringify(run), (key, value) =>
-  key === 'receipt' && typeof value === 'string' ? `${value.slice(0, 6)}…` : value,
-);
-writeFileSync(join(outDir, 'run.masked.json'), JSON.stringify(masked, null, 2));
 console.log(`video ${final} ${run.video.width}x${run.video.height} ${run.video.duration.toFixed(1)}s ${run.video.bytes} bytes`);
 console.log(`shift ${JSON.stringify(run.evidence ?? null)} clean ${main.clean?.id ?? 'none'}`);
 if (run.scrollAnchoring) console.log(`scroll anchoring ${JSON.stringify(run.scrollAnchoring)}`);
-if (main.courseCalls?.length || run.takes.berlin.courseCalls?.length) {
+if (main.courseCalls.length || berlin.courseCalls.length) {
   console.error('record: a rehearsal request reached for the course host');
   process.exit(1);
 }

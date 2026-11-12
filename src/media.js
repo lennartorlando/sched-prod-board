@@ -26,8 +26,13 @@ export default {
     const headers = new Headers(asset.headers);
     headers.set('accept-ranges', 'bytes');
 
+    // A client resuming a file it fetched before sends If-Range with that file's validator.
+    // When the file has changed since (a redeploy), answer the whole new file, never a splice
+    // of old and new bytes (RFC 9110, 13.1.5).
     const header = request.headers.get('range');
-    const range = header ? parseRange(header, size) : null;
+    const ifRange = request.headers.get('if-range');
+    const current = ifRange === null || ifRange === asset.headers.get('etag');
+    const range = header && current ? parseRange(header, size) : null;
     if (!range) {
       headers.set('content-length', String(size));
       return new Response(request.method === 'HEAD' ? null : body, { status: 200, headers });

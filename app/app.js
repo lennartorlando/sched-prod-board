@@ -1,6 +1,7 @@
 import { ack, fetchIncidents } from './api.js';
 
 const REFRESH_MS = 2000;
+const STALL_MS = 10000; // a pending answer older than this is reported, never doubled
 
 const list = document.querySelector('[data-testid="incident-list"]');
 const loader = document.querySelector('[data-testid="loader"]');
@@ -52,7 +53,7 @@ function formatStamp(iso) {
 // --- Rows, keyed by incident id (SCHED-4511) --------------------------------
 
 const rows = new Map(); // incident id -> <li>
-const acked = new Set(); // incident ids whose ack succeeded
+const acked = new Map(); // incident id -> ackedAt of the ack that succeeded
 
 function cell(tag, className) {
   const el = document.createElement(tag);
@@ -74,16 +75,32 @@ function createRow(incident) {
   return li;
 }
 
+function ackedMark(at) {
+  const mark = cell('span', 'acked');
+  mark.dataset.testid = 'acked';
+  mark.textContent = `acked ${clockFormat.format(new Date(at))}`;
+  return mark;
+}
+
+// The action cell follows `acked`: an acked incident shows its mark, also when its row is
+// rebuilt; an Ack in flight or an error note is left alone.
+function syncAction(li, id) {
+  const at = acked.get(id);
+  li.classList.toggle('is-acked', at !== undefined);
+  const action = li.querySelector('.action');
+  if (at !== undefined && !action.querySelector('[data-testid="acked"]')) action.replaceChildren(ackedMark(at));
+}
+
 function updateRow(li, incident) {
   const severity = /^sev\d$/.test(incident.severity) ? incident.severity : 'sev-other';
   li.className = `row ${severity}`;
-  li.classList.toggle('is-acked', acked.has(incident.id));
   li.querySelector('.id').textContent = incident.id;
   li.querySelector('.sev').textContent = incident.severity;
   li.querySelector('.what').textContent = `${incident.service} · ${incident.region} · ${incident.summary}`;
   const time = li.querySelector('.when');
   time.dateTime = incident.openedAt;
   time.textContent = formatStamp(incident.openedAt);
+  syncAction(li, incident.id);
 }
 
 // Newest first, in the API's order. Known rows keep their node (and their acked mark);
@@ -121,12 +138,8 @@ async function takeIncident(li) {
   action.querySelector('.ack-error')?.remove();
   try {
     const reply = await ack(id);
-    acked.add(id);
-    const mark = cell('span', 'acked');
-    mark.dataset.testid = 'acked';
-    mark.textContent = `acked ${clockFormat.format(new Date(reply.ackedAt ?? Date.now()))}`;
-    action.replaceChildren(mark);
-    li.classList.add('is-acked');
+    acked.set(id, reply.ackedAt ?? new Date().toISOString());
+    syncAction(li, id);
   } catch (error) {
     console.error(error);
     button.disabled = false;
@@ -148,6 +161,7 @@ list.addEventListener('click', (event) => {
 
 let loaded = false;
 let inFlight = false;
+let lastUpdate = null;
 let timer;
 
 async function refresh() {
@@ -155,9 +169,16 @@ async function refresh() {
   inFlight = true;
   clearTimeout(timer);
   const started = performance.now();
+  const stall = setTimeout(() => {
+    status.textContent = loaded
+      ? `No update since ${clockFormat.format(lastUpdate)}. Waiting for the server…`
+      : 'Still waiting for incidents…';
+  }, STALL_MS);
   try {
     const page = await fetchIncidents();
-    render(Array.isArray(page.incidents) ? page.incidents : []);
+    if (!Array.isArray(page?.incidents)) throw new Error('incidents: the answer holds no incident list');
+    render(page.incidents);
+    lastUpdate = new Date();
     if (!loaded) {
       loaded = true;
       loader.hidden = true;
@@ -169,6 +190,7 @@ async function refresh() {
       ? `Last update failed at ${clockFormat.format(new Date())}. Retrying…`
       : 'Could not load incidents. Retrying…';
   } finally {
+    clearTimeout(stall);
     inFlight = false;
     timer = setTimeout(refresh, Math.max(0, REFRESH_MS - (performance.now() - started)));
   }
