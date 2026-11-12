@@ -184,7 +184,7 @@ async function take(browser, spec, url, { fake, main }) {
         });
       });
     const ackReply = () => {
-      const reply = page.waitForResponse((res) => /\/ack\?/.test(res.url()), { timeout: 15000 });
+      const reply = page.waitForResponse((res) => /\/ack\?/.test(res.url()), { timeout: 60000 }); // a slow answer still brings its receipt
       reply.catch(() => {}); // a waiter nobody awaits (a click threw) must not end the process before save()
       return reply;
     };
@@ -232,7 +232,9 @@ async function take(browser, spec, url, { fake, main }) {
         const body = await res.json().catch(() => null);
         if (!res.ok()) throw new Error(`record: the ${label} ack answered ${res.status()}`);
         await page.locator(`[data-testid="incident-row"][data-id="${id}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
-        return { ...mark(`${label}-acked`, { id, ackedId: body?.id ?? null }), ackedId: body?.id ?? null, status: res.status() };
+        const done = mark(`${label}-acked`, { id, ackedId: body?.id ?? null, bar: await barText() });
+        await confirmBar.waitFor({ state: 'hidden', timeout: 5000 }); // the bar says "acked" for a moment, then closes
+        return { ...done, ackedId: body?.id ?? null, status: res.status() };
       };
 
       await nextArrival();

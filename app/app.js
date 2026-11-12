@@ -143,6 +143,9 @@ const confirmError = confirmBar.querySelector('.confirm-error');
 const confirmAck = confirmBar.querySelector('[data-testid="confirm-ack"]');
 const confirmCancel = confirmBar.querySelector('[data-testid="confirm-cancel"]');
 let pending = null; // { id, sending }
+let doneTimer;
+// After an ack the bar says so for a moment; until it closes, a click on it does nothing.
+const ACKED_SHOWN_MS = 1500;
 
 function syncRows() {
   for (const [id, li] of rows) syncAction(li, id);
@@ -151,17 +154,20 @@ function syncRows() {
 function openConfirm(li) {
   if (pending?.sending) return; // one ack at a time; the row Acks are disabled meanwhile
   const id = li.dataset.id;
+  clearTimeout(doneTimer);
   pending = { id, sending: false };
   confirmId.textContent = `Ack ${id}?`;
   confirmWhat.textContent = `${li.querySelector('.sev').textContent} · ${li.querySelector('.what').textContent}`;
   confirmError.textContent = '';
   confirmAck.textContent = `Ack ${id}`;
+  confirmCancel.textContent = 'Cancel';
   confirmBar.hidden = false;
   syncRows();
   confirmAck.focus({ preventScroll: true });
 }
 
 function closeConfirm() {
+  clearTimeout(doneTimer);
   const id = pending?.id;
   pending = null;
   confirmBar.hidden = true;
@@ -183,8 +189,13 @@ async function sendAck() {
   try {
     const reply = await ack(id);
     acked.set(id, reply.ackedAt ?? new Date().toISOString());
+    pending = null;
     confirmBar.removeAttribute('aria-busy');
-    closeConfirm();
+    confirmId.textContent = `${id} acked.`;
+    confirmAck.textContent = 'Acked';
+    confirmCancel.textContent = 'Close';
+    syncRows();
+    doneTimer = setTimeout(closeConfirm, ACKED_SHOWN_MS);
   } catch (error) {
     console.error(error);
     pending.sending = false;

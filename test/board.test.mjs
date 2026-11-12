@@ -232,7 +232,12 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     assert.equal(night.log.acks[0].id, 'INC-4640');
     assert.equal(night.log.acks[0].cursor, night.log.acks[0].lastServed);
     assert.notEqual(night.log.acks[0].cursor, 'cursor-0');
-    assert.equal(await page.getByTestId('confirm').isVisible(), false);
+    // The bar says so for a moment; a click on it then (the replay clicks again after 400 ms)
+    // lands at once and sends nothing more.
+    assert.match(await page.getByTestId('confirm').textContent(), /INC-4640 acked\./);
+    await page.getByTestId('confirm-ack').click({ timeout: 1000 });
+    await page.getByTestId('confirm').waitFor({ state: 'hidden', timeout: 3000 });
+    assert.equal(night.log.acks.length, 1);
     assert.equal(await rowOf(page, 'INC-4640').getByTestId('ack').count(), 0);
     night.addIncident({ id: 'INC-9002', service: 'auth', region: 'eu-west', summary: 'pushes rows down', severity: 'sev1', openedAt: '2026-11-12T03:20:00.000Z' });
     await rowOf(page, 'INC-9002').waitFor({ timeout: 5000 });
@@ -317,7 +322,8 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     night.failAck = false;
     await page.getByTestId('confirm-ack').click();
     await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
-    assert.equal(await bar.isVisible(), false);
+    assert.equal(await alert.textContent(), '', 'the note goes once the ack lands');
+    await bar.waitFor({ state: 'hidden', timeout: 3000 });
     assert.equal(night.log.acks.length, 3);
     await context.close();
   });
