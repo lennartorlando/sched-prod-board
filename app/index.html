@@ -20,5 +20,10 @@
       <ul data-testid="incident-list" class="list"></ul>
     </main>
     <footer>sched-prod incident board · build <span data-testid="build-sha" class="sha">__BUILD_SHA__</span></footer>
+    <section data-testid="confirm" class="confirm" role="dialog" aria-label="Confirm the ack" hidden>
+      <p class="confirm-text"><strong class="confirm-id"></strong> <span class="confirm-what"></span> <span class="confirm-error" role="alert"></span></p>
+      <button type="button" class="confirm-ack" data-testid="confirm-ack">Ack</button>
+      <button type="button" class="confirm-cancel" data-testid="confirm-cancel">Cancel</button>
+    </section>
   </body>
 </html>

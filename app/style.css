@@ -16,6 +16,13 @@ h1 { margin: 0; font-size: 22px; }
 .row .ack:disabled { opacity: 0.6; cursor: progress; }
 .row.is-acked { background: #f2faf5; }
 .row .acked { color: #0a7a3d; font-weight: 600; }
-.row .ack-error { color: #b00020; font-size: 13px; }
 footer { color: #555; font-size: 14px; }
 footer .sha { font-family: ui-monospace, monospace; color: #1d1d1f; }
+.row.is-confirming { outline: 2px solid #1d1d1f; outline-offset: -2px; }
+.confirm { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 12px; align-items: center; padding: 14px 24px; background: #1d1d1f; color: #fff; z-index: 10; }
+.confirm .confirm-text { flex: 1; margin: 0; }
+.confirm .confirm-error { color: #ffb4b4; font-weight: 600; }
+.confirm button { font: inherit; padding: 4px 14px; border: 1px solid #fff; border-radius: 6px; background: transparent; color: #fff; cursor: pointer; }
+.confirm .confirm-ack { background: #fff; color: #1d1d1f; font-weight: 600; }
+.confirm button:disabled { opacity: 0.6; cursor: progress; }
+body.confirming { padding-bottom: 72px; }

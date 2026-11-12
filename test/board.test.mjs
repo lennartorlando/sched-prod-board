@@ -196,33 +196,123 @@ describe('live list and refresh (SCHED-4511, SCHED-4513)', () => {
   });
 });
 
-describe('ack (SCHED-4511)', () => {
-  test('acks the clicked row with the latest cursor and keeps the mark through refreshes', async () => {
+describe('ack with a confirm (SCHED-4511, product step two)', () => {
+  const rowOf = (page, id) => page.locator(`[data-testid="incident-row"][data-id="${id}"]`);
+  const confirmAck = async (page, id) => {
+    await rowOf(page, id).getByTestId('ack').click();
+    await page.getByTestId('confirm').waitFor();
+    await page.getByTestId('confirm-ack').click();
+  };
+
+  test('Ack opens a confirm that names the incident and sends nothing', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    await rowOf(page, 'INC-4640').getByTestId('ack').click();
+    const bar = page.getByTestId('confirm');
+    await bar.waitFor();
+    assert.match(await bar.textContent(), /INC-4640/);
+    assert.match(await page.getByTestId('confirm-ack').textContent(), /INC-4640/);
+    assert.equal(await rowOf(page, 'INC-4640').evaluate((li) => li.classList.contains('is-confirming')), true);
+    await page.waitForTimeout(500);
+    assert.equal(night.log.acks.length, 0);
+    assert.equal(await page.getByTestId('acked').count(), 0);
+    await context.close();
+  });
+
+  test('confirm-ack acks the named incident with the latest cursor and keeps the mark', async () => {
     const night = createFakeNight();
     const { context, page } = await openBoard(night);
     await page.getByTestId('incident-row').first().waitFor();
     await page.waitForTimeout(2500);
-    const row = page.locator('[data-testid="incident-row"][data-id="INC-4640"]');
-    await row.getByTestId('ack').click();
-    await row.getByTestId('acked').waitFor();
+    await confirmAck(page, 'INC-4640');
+    await rowOf(page, 'INC-4640').getByTestId('acked').waitFor();
     assert.equal(night.log.acks.length, 1);
     assert.equal(night.log.acks[0].id, 'INC-4640');
     assert.equal(night.log.acks[0].cursor, night.log.acks[0].lastServed);
     assert.notEqual(night.log.acks[0].cursor, 'cursor-0');
-    assert.equal(await row.getByTestId('ack').count(), 0);
-    assert.equal(await page.getByTestId('acked').count(), 1);
+    assert.equal(await page.getByTestId('confirm').isVisible(), false);
+    assert.equal(await rowOf(page, 'INC-4640').getByTestId('ack').count(), 0);
     night.addIncident({ id: 'INC-9002', service: 'auth', region: 'eu-west', summary: 'pushes rows down', severity: 'sev1', openedAt: '2026-11-12T03:20:00.000Z' });
-    await page.locator('[data-testid="incident-row"][data-id="INC-9002"]').waitFor({ timeout: 5000 });
-    assert.equal(await row.getByTestId('acked').count(), 1);
+    await rowOf(page, 'INC-9002').waitFor({ timeout: 5000 });
     assert.equal(await page.getByTestId('acked').count(), 1);
+    assert.equal(await rowOf(page, 'INC-4640').getByTestId('acked').count(), 1);
+    await context.close();
+  });
+
+  test('a new incident moving the rows between the two clicks still acks the named incident', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    const button = rowOf(page, 'INC-2662').getByTestId('ack');
+    const box = await button.boundingBox();
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await page.getByTestId('confirm').waitFor();
+    night.addIncident({ id: 'INC-9003', service: 'auth', region: 'eu-west', summary: 'lands on top', severity: 'sev1', openedAt: '2026-11-12T03:21:00.000Z' });
+    await rowOf(page, 'INC-9003').waitFor({ timeout: 5000 });
+    const under = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest('[data-testid="incident-row"]')?.dataset.id, [box.x + box.width / 2, box.y + box.height / 2]);
+    assert.equal(under, 'INC-9003', 'the new row is now where the first click was');
+    assert.match(await page.getByTestId('confirm').textContent(), /INC-2662/);
+    await page.getByTestId('confirm-ack').click();
+    await rowOf(page, 'INC-2662').getByTestId('acked').waitFor();
+    assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-2662']);
+    assert.equal(await rowOf(page, 'INC-9003').getByTestId('acked').count(), 0);
+    await context.close();
+  });
+
+  test('Cancel and Escape close the confirm and send nothing', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    await rowOf(page, 'INC-1778').getByTestId('ack').click();
+    await page.getByTestId('confirm-cancel').click();
+    assert.equal(await page.getByTestId('confirm').isVisible(), false);
+    await rowOf(page, 'INC-1778').getByTestId('ack').click();
+    await page.getByTestId('confirm').waitFor();
+    await page.keyboard.press('Escape');
+    assert.equal(await page.getByTestId('confirm').isVisible(), false);
+    assert.equal(await rowOf(page, 'INC-1778').evaluate((li) => li.classList.contains('is-confirming')), false);
+    await page.waitForTimeout(300);
+    assert.equal(night.log.acks.length, 0);
+    await context.close();
+  });
+
+  test('a second Ack while the confirm is open names the new incident only', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    await rowOf(page, 'INC-4640').getByTestId('ack').click();
+    await rowOf(page, 'INC-1778').getByTestId('ack').click();
+    const text = await page.getByTestId('confirm').textContent();
+    assert.match(text, /INC-1778/);
+    assert.doesNotMatch(text, /INC-4640/);
+    await page.getByTestId('confirm-ack').click();
+    await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
+    assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-1778']);
+    assert.equal(await page.getByTestId('confirm').count(), 1);
+    await context.close();
+  });
+
+  test('a failed ack keeps the confirm open with one error; a retry acks', async () => {
+    const night = createFakeNight({ failAck: true });
+    const { context, page } = await openBoard(night);
+    await confirmAck(page, 'INC-1778');
+    const bar = page.getByTestId('confirm');
+    await bar.getByRole('alert').filter({ hasText: 'Ack failed' }).waitFor();
+    assert.equal(await page.getByTestId('confirm-ack').isEnabled(), true);
+    assert.equal(await page.getByTestId('acked').count(), 0);
+    await page.getByTestId('confirm-ack').click();
+    await page.waitForFunction(() => !document.querySelector('[data-testid="confirm-ack"]').disabled);
+    assert.equal(await bar.getByRole('alert').count(), 1, 'a second failure replaces the note, never stacks it');
+    night.failAck = false;
+    await page.getByTestId('confirm-ack').click();
+    await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
+    assert.equal(await bar.isVisible(), false);
+    assert.equal(night.log.acks.length, 3);
     await context.close();
   });
 
   test('an acked incident keeps its mark when its row leaves and comes back', async () => {
     const night = createFakeNight();
     const { context, page } = await openBoard(night);
-    const row = page.locator('[data-testid="incident-row"][data-id="INC-4640"]');
-    await row.getByTestId('ack').click();
+    const row = rowOf(page, 'INC-4640');
+    await confirmAck(page, 'INC-4640');
     await row.getByTestId('acked').waitFor();
     night.setIncidents(BASE_INCIDENTS.filter((i) => i.id !== 'INC-4640'));
     await row.waitFor({ state: 'detached', timeout: 5000 });
@@ -231,34 +321,6 @@ describe('ack (SCHED-4511)', () => {
     assert.equal(await row.getByTestId('acked').count(), 1);
     assert.equal(await row.getByTestId('ack').count(), 0);
     assert.equal(night.log.acks.length, 1);
-    await context.close();
-  });
-
-  test('after a failed ack, a second click acks and clears the error', async () => {
-    const night = createFakeNight({ failAck: true });
-    const { context, page } = await openBoard(night);
-    const row = page.locator('[data-testid="incident-row"][data-id="INC-1778"]');
-    await row.getByTestId('ack').click();
-    await row.getByRole('alert').waitFor();
-    night.failAck = false;
-    await row.getByTestId('ack').click();
-    await row.getByTestId('acked').waitFor();
-    assert.equal(await row.getByRole('alert').count(), 0);
-    assert.equal(night.log.acks.length, 2);
-    await context.close();
-  });
-
-  test('a failed ack leaves the button enabled with an error and no mark', async () => {
-    const night = createFakeNight({ failAck: true });
-    const { context, page } = await openBoard(night);
-    const row = page.locator('[data-testid="incident-row"][data-id="INC-1778"]');
-    await row.getByTestId('ack').click();
-    await row.getByRole('alert').waitFor();
-    assert.equal(await row.getByTestId('ack').isEnabled(), true);
-    assert.equal(await page.getByTestId('acked').count(), 0);
-    await row.getByTestId('ack').click();
-    await page.waitForFunction(() => document.querySelectorAll('[data-testid="ack"]:disabled').length === 0);
-    assert.equal(await row.getByRole('alert').count(), 1, 'a second failure replaces the note, never stacks it');
     await context.close();
   });
 });

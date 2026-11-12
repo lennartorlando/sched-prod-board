@@ -83,10 +83,11 @@ function ackedMark(at) {
 }
 
 // The action cell follows `acked`: an acked incident shows its mark, also when its row is
-// rebuilt; an Ack in flight or an error note is left alone.
+// rebuilt. The row the confirm names stays outlined while the confirm is open.
 function syncAction(li, id) {
   const at = acked.get(id);
   li.classList.toggle('is-acked', at !== undefined);
+  li.classList.toggle('is-confirming', pending?.id === id);
   const action = li.querySelector('.action');
   if (at !== undefined && !action.querySelector('[data-testid="acked"]')) action.replaceChildren(ackedMark(at));
 }
@@ -127,34 +128,81 @@ function render(incidents) {
   empty.hidden = incidents.length > 0;
 }
 
-// --- Ack (SCHED-4511) --------------------------------------------------------
+// --- Ack with a confirm (SCHED-4511, product's step-two decision) ------------
+// A click on a row's Ack only opens the confirm bar, which names that incident. The bar is
+// fixed at the bottom of the screen, so it stays put while new incidents move the rows; the
+// ack goes out for the id the bar names, never for whatever row is under the pointer later.
 
-async function takeIncident(li) {
+const confirmBar = document.querySelector('[data-testid="confirm"]');
+const confirmId = confirmBar.querySelector('.confirm-id');
+const confirmWhat = confirmBar.querySelector('.confirm-what');
+const confirmError = confirmBar.querySelector('.confirm-error');
+const confirmAck = confirmBar.querySelector('[data-testid="confirm-ack"]');
+const confirmCancel = confirmBar.querySelector('[data-testid="confirm-cancel"]');
+let pending = null; // { id, sending }
+
+function outlineRows() {
+  for (const [id, li] of rows) li.classList.toggle('is-confirming', pending?.id === id);
+}
+
+function openConfirm(li) {
+  if (pending?.sending) return; // one ack at a time
   const id = li.dataset.id;
-  const action = li.querySelector('.action');
-  const button = action.querySelector('[data-testid="ack"]');
-  button.disabled = true;
-  button.textContent = 'Acking…';
-  action.querySelector('.ack-error')?.remove();
+  pending = { id, sending: false };
+  confirmId.textContent = `Ack ${id}?`;
+  confirmWhat.textContent = `${li.querySelector('.sev').textContent} · ${li.querySelector('.what').textContent}`;
+  confirmError.textContent = '';
+  confirmAck.textContent = `Ack ${id}`;
+  confirmAck.disabled = false;
+  confirmCancel.disabled = false;
+  confirmBar.hidden = false;
+  document.body.classList.add('confirming');
+  outlineRows();
+  confirmAck.focus({ preventScroll: true });
+}
+
+function closeConfirm() {
+  pending = null;
+  confirmBar.hidden = true;
+  document.body.classList.remove('confirming');
+  outlineRows();
+}
+
+async function sendAck() {
+  if (!pending || pending.sending) return;
+  const { id } = pending;
+  pending.sending = true;
+  confirmAck.disabled = true;
+  confirmCancel.disabled = true;
+  confirmAck.textContent = 'Acking…';
+  confirmError.textContent = '';
   try {
     const reply = await ack(id);
     acked.set(id, reply.ackedAt ?? new Date().toISOString());
-    syncAction(li, id);
+    closeConfirm();
+    const li = rows.get(id);
+    if (li) syncAction(li, id);
   } catch (error) {
     console.error(error);
-    button.disabled = false;
-    button.textContent = 'Ack';
-    const note = cell('span', 'ack-error');
-    note.setAttribute('role', 'alert');
-    note.textContent = 'Ack failed. Try again.';
-    action.append(note);
+    pending.sending = false;
+    confirmAck.disabled = false;
+    confirmCancel.disabled = false;
+    confirmAck.textContent = `Ack ${id}`;
+    confirmError.textContent = 'Ack failed. Try again.';
   }
 }
 
 list.addEventListener('click', (event) => {
   const button = event.target.closest('[data-testid="ack"]');
   if (!button || button.disabled) return;
-  takeIncident(button.closest('[data-testid="incident-row"]'));
+  openConfirm(button.closest('[data-testid="incident-row"]'));
+});
+confirmAck.addEventListener('click', sendAck);
+confirmCancel.addEventListener('click', () => {
+  if (!pending?.sending) closeConfirm();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && pending && !pending.sending) closeConfirm();
 });
 
 // --- Loader and refresh (SCHED-4512, SCHED-4513) ----------------------------

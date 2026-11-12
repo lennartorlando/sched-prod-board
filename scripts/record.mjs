@@ -3,9 +3,9 @@
 // run record of every moment (offsets from the video's start) and every ack reply.
 //
 // usage:
-//   node scripts/record.mjs --rehearse [--fail-shift-ack] [--out <dir>] [--private <dir>]
+//   node scripts/record.mjs --rehearse [--step 2] [--fail-shift-ack] [--out <dir>] [--private <dir>]
 //       local build + fake API; sends nothing to the course
-//   node scripts/record.mjs --live <board url> [--out <dir>] [--private <dir>]
+//   node scripts/record.mjs --live <board url> [--step 2] [--out <dir>] [--private <dir>]
 //       the real board; sends two real acks
 //
 // --out gets the shareable files (step1.mp4, stills, run.masked.json); --private gets the full
@@ -34,11 +34,14 @@ const { values } = parseArgs({
     out: { type: 'string' },
     private: { type: 'string' },
     'fail-shift-ack': { type: 'boolean', default: false },
+    step: { type: 'string', default: '1' }, // 2: the build with the confirm bar (product's step-two decision)
   },
 });
 if (values.rehearse === Boolean(values.live)) throw new Error('record: pass exactly one of --rehearse or --live <url>');
 if (values['fail-shift-ack'] && !values.rehearse) throw new Error('record: --fail-shift-ack is for rehearsals only');
 const mode = values.rehearse ? 'rehearsal' : 'live';
+const step2 = values.step === '2';
+if (!['1', '2'].includes(values.step)) throw new Error('record: --step is 1 or 2');
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
 const outDir = resolve(values.out ?? join(REPO, 'recordings', `${mode}-${stamp}`));
 const privateDir = resolve(values.private ?? (values.rehearse ? join(outDir, 'private') : join(REPO, '..', 'private', 'recordings', `${mode}-${stamp}`)));
@@ -197,6 +200,95 @@ async function take(browser, spec, url, { fake, main }) {
 
     if (!main) {
       await sleep(12000);
+    } else if (step2) {
+      // Step two: every Ack goes through the confirm bar, which names the incident.
+      const center = async (locator) => {
+        const b = await locator.boundingBox();
+        return { x: Math.round(b.x + b.width / 2), y: Math.round(b.y + b.height / 2) };
+      };
+      const moveTo = async (locator) => {
+        const p = await center(locator);
+        await page.mouse.move(p.x, p.y, { steps: 20 });
+        return p;
+      };
+      const confirmBar = page.getByTestId('confirm');
+      const barText = async () => (await confirmBar.textContent()).replace(/\s+/g, ' ').trim();
+      const confirmAndAck = async (id, label) => {
+        await confirmBar.waitFor({ timeout: 5000 });
+        const named = mark(`${label}-confirm`, { id, bar: await barText() });
+        if (!named.bar.includes(id)) throw new Error(`record: the confirm names "${named.bar}", not ${id}`);
+        await sleep(1500); // the viewer reads the bar
+        await moveTo(page.getByTestId('confirm-ack'));
+        const reply = ackReply();
+        mark(`${label}-confirm-ack`, { id });
+        await page.getByTestId('confirm-ack').click();
+        const res = await reply;
+        const body = await res.json().catch(() => null);
+        if (!res.ok()) throw new Error(`record: the ${label} ack answered ${res.status()}`);
+        await page.locator(`[data-testid="incident-row"][data-id="${id}"] [data-testid="acked"]`).waitFor({ timeout: 10000 });
+        return { ...mark(`${label}-acked`, { id, ackedId: body?.id ?? null }), ackedId: body?.id ?? null, status: res.status() };
+      };
+
+      await nextArrival();
+      await nextArrival();
+      await sleep(1200);
+      const cleanId = await page.getByTestId('incident-row').first().getAttribute('data-id');
+      const cleanAck = page.locator(`[data-testid="incident-row"][data-id="${cleanId}"] [data-testid="ack"]`);
+      await moveTo(cleanAck);
+      mark('clean-click', { id: cleanId });
+      await cleanAck.click();
+      record.clean = { id: cleanId, ...(await confirmAndAck(cleanId, 'clean')) };
+      save();
+
+      for (let attempt = 1; attempt <= 3 && !record.shift; attempt += 1) {
+        const anchor = await nextArrival();
+        await sleep(Math.max(0, REST_AFTER_ARRIVAL_MS - (at() - anchor.t)));
+        const intended = await page.getByTestId('incident-row').first().getAttribute('data-id');
+        const { x, y } = await center(page.locator(`[data-testid="incident-row"][data-id="${intended}"] [data-testid="ack"]`));
+        const waitArrival = nextArrival(20000);
+        await page.mouse.move(x, y, { steps: 20 });
+        const restedOn = await rowAt(x, y);
+        const rest = mark('pointer-rests', { intended, restedOn, x, y });
+        if (restedOn !== intended) {
+          mark('rest-moved', { intended, restedOn });
+          await waitArrival.catch(() => {});
+          continue;
+        }
+        const arrival = await waitArrival;
+        await sleep(120);
+        const clicked = await rowAt(x, y);
+        if (clicked === intended) {
+          mark('shift-missed', { intended, clicked });
+          continue;
+        }
+        const acksBefore = record.acks.length;
+        const click = mark('shift-click', { intended, clicked, arrival: arrival.id, msAfterArrival: at() - arrival.t });
+        await page.mouse.click(x, y);
+        await confirmBar.waitFor({ timeout: 5000 });
+        const named = mark('shift-confirm', { bar: await barText() });
+        if (!named.bar.includes(clicked)) throw new Error(`record: the confirm names "${named.bar}", not ${clicked}`);
+        await sleep(2000); // the viewer reads the wrong id
+        await moveTo(page.getByTestId('confirm-cancel'));
+        const cancel = mark('shift-cancel', { clicked });
+        await page.getByTestId('confirm-cancel').click();
+        await confirmBar.waitFor({ state: 'hidden', timeout: 5000 });
+        await sleep(800);
+        if (record.acks.length !== acksBefore) throw new Error('record: an ack went out before the confirm');
+        const intendedAck = page.locator(`[data-testid="incident-row"][data-id="${intended}"] [data-testid="ack"]`);
+        await moveTo(intendedAck);
+        mark('intended-click', { id: intended });
+        await intendedAck.click();
+        const acked = await confirmAndAck(intended, 'intended');
+        record.shift = { intended, restedOn, clicked, arrival: arrival.id, barNamed: clicked, restT: rest.t, arrivalT: arrival.t, clickT: click.t, confirmT: named.t, cancelT: cancel.t, ackedT: acked.t, ackedId: acked.ackedId };
+        save();
+      }
+
+      await sleep(20000);
+      record.after = await page.evaluate(() => ({
+        rows: document.querySelectorAll('[data-testid="incident-row"]').length,
+        acked: [...document.querySelectorAll('[data-testid="acked"]')].map((m) => m.closest('[data-testid="incident-row"]').dataset.id),
+      }));
+      mark('watch-end', record.after);
     } else {
       // Watch two arrivals.
       await nextArrival();
@@ -330,7 +422,7 @@ try {
   }
   run.url = url;
   await take(browser, MAIN, url, { fake, main: true });
-  await take(browser, SECOND, url, { fake: fakeSecond, main: false });
+  if (!step2) await take(browser, SECOND, url, { fake: fakeSecond, main: false });
   if (values.rehearse) run.scrollAnchoring = await scrollProbe(browser, url);
 } finally {
   await browser.close();
@@ -339,8 +431,9 @@ try {
 }
 
 // Video: each take to H.264, then joined, main first, index at the front.
+const takeNames = Object.keys(run.takes); // main, then berlin in step one
 const parts = [];
-for (const name of ['main', 'berlin']) {
+for (const name of takeNames) {
   const mp4 = join(outDir, 'parts', `${name}.mp4`);
   ffmpeg(['-i', run.takes[name].webm, '-vf', 'setpts=PTS-STARTPTS', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '22', '-preset', 'medium', '-an', mp4]);
   run.takes[name].mp4 = probe(mp4);
@@ -348,24 +441,32 @@ for (const name of ['main', 'berlin']) {
 }
 const list = join(outDir, 'parts', 'parts.txt');
 writeFileSync(list, parts.map((p) => `file '${p}'`).join('\n') + '\n');
-const final = join(outDir, 'step1.mp4');
+const final = join(outDir, step2 ? 'step2.mp4' : 'step1.mp4');
 ffmpeg(['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', final]);
 run.video = { file: final, ...probe(final), bytes: statSync(final).size };
 
 const main = run.takes.main;
+const firstSecondAfter = (ms) => Math.floor((ms + 999) / 1000) * 1000;
 run.stills = {};
 if (main.clean?.t) run.stills.clean = still(final, main.clean.t + 400, 'clean-acked');
-if (main.shift) {
+if (main.shift && step2) {
+  run.stills.rest = still(final, main.shift.arrivalT - 300, 'shift-rest');
+  run.stills.confirm = still(final, main.shift.confirmT + 600, 'shift-confirm-names-clicked');
+  run.stills.acked = still(final, main.shift.ackedT + 400, 'intended-acked');
+  const atMs = firstSecondAfter(main.shift.confirmT); // the bar names the row the click landed on
+  run.evidence = { at: mmss(atMs), intended: main.shift.intended, clicked: main.shift.clicked, barNamed: main.shift.barNamed, acked: main.shift.ackedId, ackedAt: mmss(firstSecondAfter(main.shift.ackedT)) };
+  run.stills.at = still(final, atMs, 'evidence-at');
+} else if (main.shift) {
   run.stills.rest = still(final, main.shift.arrivalT - 300, 'shift-rest');
   run.stills.click = still(final, main.shift.clickT + 150, 'shift-click');
   run.stills.acked = still(final, main.shift.ackedT + 400, 'shift-acked');
-  const atMs = Math.floor((main.shift.ackedT + 999) / 1000) * 1000; // first whole second with the mark on screen
+  const atMs = firstSecondAfter(main.shift.ackedT); // first whole second with the mark on screen
   run.evidence = { at: mmss(atMs), intended: main.shift.intended, acked: main.shift.ackedId };
   run.stills.at = still(final, atMs, 'evidence-at');
 }
 if (main.stable) run.stills.stableMain = still(final, main.stable.t + 500, 'stable-auckland');
 const berlin = run.takes.berlin;
-if (berlin.stable) {
+if (berlin?.stable) {
   berlin.stable.tInVideo = Math.round(main.mp4.duration * 1000) + berlin.stable.t;
   run.stills.stableBerlin = still(final, berlin.stable.tInVideo + 500, 'stable-berlin');
 }
@@ -374,7 +475,7 @@ save();
 console.log(`video ${final} ${run.video.width}x${run.video.height} ${run.video.duration.toFixed(1)}s ${run.video.bytes} bytes`);
 console.log(`shift ${JSON.stringify(run.evidence ?? null)} clean ${main.clean?.id ?? 'none'}`);
 if (run.scrollAnchoring) console.log(`scroll anchoring ${JSON.stringify(run.scrollAnchoring)}`);
-if (main.courseCalls.length || berlin.courseCalls.length) {
+if (main.courseCalls.length || berlin?.courseCalls.length) {
   console.error('record: a rehearsal request reached for the course host');
   process.exit(1);
 }
