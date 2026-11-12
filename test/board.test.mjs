@@ -210,8 +210,10 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     await rowOf(page, 'INC-4640').getByTestId('ack').click();
     const bar = page.getByTestId('confirm');
     await bar.waitFor();
-    assert.match(await bar.textContent(), /INC-4640/);
-    assert.match(await page.getByTestId('confirm-ack').textContent(), /INC-4640/);
+    const text = await bar.textContent();
+    assert.match(text, /INC-4640/);
+    for (const part of ['sev3', 'exports', 'eu-west', 'webhook retries piling up']) assert.ok(text.includes(part), `the bar shows ${part}`);
+    assert.equal(await page.getByTestId('confirm-ack').textContent(), 'Ack INC-4640');
     assert.equal(await rowOf(page, 'INC-4640').evaluate((li) => li.classList.contains('is-confirming')), true);
     await page.waitForTimeout(500);
     assert.equal(night.log.acks.length, 0);
@@ -251,6 +253,9 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     const under = await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest('[data-testid="incident-row"]')?.dataset.id, [box.x + box.width / 2, box.y + box.height / 2]);
     assert.equal(under, 'INC-9003', 'the new row is now where the first click was');
     assert.match(await page.getByTestId('confirm').textContent(), /INC-2662/);
+    await page.waitForTimeout(2500); // one more refresh rebuilds the row classes
+    const outlined = await page.locator('.row.is-confirming').evaluateAll((rs) => rs.map((r) => r.dataset.id));
+    assert.deepEqual(outlined, ['INC-2662'], 'the outline stays on the named row, not on the row under the pointer');
     await page.getByTestId('confirm-ack').click();
     await rowOf(page, 'INC-2662').getByTestId('acked').waitFor();
     assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-2662']);
@@ -261,14 +266,19 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
   test('Cancel and Escape close the confirm and send nothing', async () => {
     const night = createFakeNight();
     const { context, page } = await openBoard(night);
+    const height = () => page.evaluate(() => document.documentElement.scrollHeight);
+    const closedHeight = await height();
     await rowOf(page, 'INC-1778').getByTestId('ack').click();
+    assert.equal(await height(), closedHeight, 'opening the bar does not change the page height');
     await page.getByTestId('confirm-cancel').click();
     assert.equal(await page.getByTestId('confirm').isVisible(), false);
+    assert.equal(await height(), closedHeight, 'closing the bar does not change the page height');
     await rowOf(page, 'INC-1778').getByTestId('ack').click();
     await page.getByTestId('confirm').waitFor();
     await page.keyboard.press('Escape');
     assert.equal(await page.getByTestId('confirm').isVisible(), false);
     assert.equal(await rowOf(page, 'INC-1778').evaluate((li) => li.classList.contains('is-confirming')), false);
+    assert.equal(await rowOf(page, 'INC-1778').getByTestId('ack').evaluate((b) => b === document.activeElement), true, 'focus goes back to the row');
     await page.waitForTimeout(300);
     assert.equal(night.log.acks.length, 0);
     await context.close();
@@ -282,10 +292,11 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     const text = await page.getByTestId('confirm').textContent();
     assert.match(text, /INC-1778/);
     assert.doesNotMatch(text, /INC-4640/);
+    const outlined = await page.locator('.row.is-confirming').evaluateAll((rs) => rs.map((r) => r.dataset.id));
+    assert.deepEqual(outlined, ['INC-1778']);
     await page.getByTestId('confirm-ack').click();
     await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
     assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-1778']);
-    assert.equal(await page.getByTestId('confirm').count(), 1);
     await context.close();
   });
 
@@ -294,17 +305,78 @@ describe('ack with a confirm (SCHED-4511, product step two)', () => {
     const { context, page } = await openBoard(night);
     await confirmAck(page, 'INC-1778');
     const bar = page.getByTestId('confirm');
-    await bar.getByRole('alert').filter({ hasText: 'Ack failed' }).waitFor();
-    assert.equal(await page.getByTestId('confirm-ack').isEnabled(), true);
+    const alert = bar.getByRole('alert');
+    await alert.filter({ hasText: 'Ack failed' }).waitFor();
+    assert.equal(await page.getByTestId('confirm-ack').textContent(), 'Ack INC-1778');
+    assert.equal(await page.getByTestId('confirm-ack').evaluate((b) => b === document.activeElement), true, 'Enter retries');
     assert.equal(await page.getByTestId('acked').count(), 0);
     await page.getByTestId('confirm-ack').click();
-    await page.waitForFunction(() => !document.querySelector('[data-testid="confirm-ack"]').disabled);
-    assert.equal(await bar.getByRole('alert').count(), 1, 'a second failure replaces the note, never stacks it');
+    await page.waitForFunction(() => !document.querySelector('[data-testid="confirm"]').hasAttribute('aria-busy'));
+    assert.equal(night.log.acks.length, 2);
+    assert.equal(await alert.textContent(), 'Ack failed. Try again.', 'a second failure replaces the note, never stacks it');
     night.failAck = false;
     await page.getByTestId('confirm-ack').click();
     await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
     assert.equal(await bar.isVisible(), false);
     assert.equal(night.log.acks.length, 3);
+    await context.close();
+  });
+
+  test('a failed ack note does not carry over to the next confirm', async () => {
+    const night = createFakeNight({ failAck: true });
+    const { context, page } = await openBoard(night);
+    await confirmAck(page, 'INC-1778');
+    const alert = page.getByTestId('confirm').getByRole('alert');
+    await alert.filter({ hasText: 'Ack failed' }).waitFor();
+    await page.getByTestId('confirm-cancel').click();
+    await rowOf(page, 'INC-4640').getByTestId('ack').click();
+    assert.match(await page.getByTestId('confirm').textContent(), /INC-4640/);
+    assert.equal(await alert.textContent(), '');
+    await context.close();
+  });
+
+  test('while an ack is sending: one ack at a time, the bar stays, a second click is a no-op', async () => {
+    const night = createFakeNight({ failAck: true });
+    const { context, page } = await openBoard(night);
+    let open;
+    const gate = new Promise((resolve) => (open = resolve));
+    await page.route('**/ack?**', async (route) => {
+      await gate;
+      await route.fallback();
+    });
+    await confirmAck(page, 'INC-4640');
+    await page.waitForFunction(() => document.querySelector('[data-testid="confirm"]').getAttribute('aria-busy') === 'true');
+    // The replay clicks confirm-ack again if the bar still shows after 400 ms: that click must
+    // land at once (no wait on a disabled button) and send nothing.
+    await page.getByTestId('confirm-ack').click({ timeout: 1000 });
+    assert.equal(await rowOf(page, 'INC-1778').getByTestId('ack').isDisabled(), true, 'row Acks are disabled while sending');
+    await page.keyboard.press('Escape');
+    await page.getByTestId('confirm-cancel').click({ timeout: 1000 });
+    assert.equal(await page.getByTestId('confirm').isVisible(), true, 'Escape and Cancel wait for the answer');
+    assert.match(await page.getByTestId('confirm').textContent(), /INC-4640/);
+    open();
+    await page.getByTestId('confirm').getByRole('alert').filter({ hasText: 'Ack failed' }).waitFor();
+    assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-4640'], 'one request for the named incident');
+    assert.equal(await rowOf(page, 'INC-1778').getByTestId('ack').isEnabled(), true);
+    await rowOf(page, 'INC-1778').getByTestId('ack').click();
+    assert.match(await page.getByTestId('confirm').textContent(), /INC-1778/);
+    await context.close();
+  });
+
+  test('a held Enter opens the confirm but does not confirm it', async () => {
+    const night = createFakeNight();
+    const { context, page } = await openBoard(night);
+    await rowOf(page, 'INC-1778').getByTestId('ack').focus();
+    await page.keyboard.down('Enter');
+    await page.keyboard.down('Enter');
+    await page.keyboard.down('Enter');
+    await page.keyboard.up('Enter');
+    await page.waitForTimeout(300);
+    assert.equal(night.log.acks.length, 0);
+    assert.equal(await page.getByTestId('confirm').isVisible(), true);
+    await page.keyboard.press('Enter'); // a fresh press confirms
+    await rowOf(page, 'INC-1778').getByTestId('acked').waitFor();
+    assert.deepEqual(night.log.acks.map((a) => a.id), ['INC-1778']);
     await context.close();
   });
 

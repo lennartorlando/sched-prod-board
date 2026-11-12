@@ -26,6 +26,7 @@ const MAIN = { name: 'main', locale: 'en-NZ', timezoneId: 'Pacific/Auckland' };
 const SECOND = { name: 'berlin', locale: 'de-DE', timezoneId: 'Europe/Berlin' };
 const STABLE_ID = 'INC-4925'; // the one openedAt that does not move between page loads
 const REST_AFTER_ARRIVAL_MS = 6500; // arrivals come every 8 to 11 s; rest the pointer before the next
+const SHIFT_ATTEMPTS = 5; // a missed shift sends nothing, so trying again only costs time
 
 const { values } = parseArgs({
   options: {
@@ -182,7 +183,11 @@ async function take(browser, spec, url, { fake, main }) {
           resolveWaiter(event);
         });
       });
-    const ackReply = () => page.waitForResponse((res) => /\/ack\?/.test(res.url()), { timeout: 15000 });
+    const ackReply = () => {
+      const reply = page.waitForResponse((res) => /\/ack\?/.test(res.url()), { timeout: 15000 });
+      reply.catch(() => {}); // a waiter nobody awaits (a click threw) must not end the process before save()
+      return reply;
+    };
     const rowAt = (x, y) =>
       page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('[data-testid="incident-row"]')?.dataset.id ?? null, [x, y]);
 
@@ -212,6 +217,7 @@ async function take(browser, spec, url, { fake, main }) {
         return p;
       };
       const confirmBar = page.getByTestId('confirm');
+      if ((await confirmBar.count()) !== 1) throw new Error('record: the board has no confirm bar; is the step-two build deployed?');
       const barText = async () => (await confirmBar.textContent()).replace(/\s+/g, ' ').trim();
       const confirmAndAck = async (id, label) => {
         await confirmBar.waitFor({ timeout: 5000 });
@@ -240,7 +246,7 @@ async function take(browser, spec, url, { fake, main }) {
       record.clean = { id: cleanId, ...(await confirmAndAck(cleanId, 'clean')) };
       save();
 
-      for (let attempt = 1; attempt <= 3 && !record.shift; attempt += 1) {
+      for (let attempt = 1; attempt <= SHIFT_ATTEMPTS && !record.shift; attempt += 1) {
         const anchor = await nextArrival();
         await sleep(Math.max(0, REST_AFTER_ARRIVAL_MS - (at() - anchor.t)));
         const intended = await page.getByTestId('incident-row').first().getAttribute('data-id');
@@ -278,10 +284,12 @@ async function take(browser, spec, url, { fake, main }) {
         await moveTo(intendedAck);
         mark('intended-click', { id: intended });
         await intendedAck.click();
+        if (values['fail-shift-ack']) fake.failAck = true;
         const acked = await confirmAndAck(intended, 'intended');
         record.shift = { intended, restedOn, clicked, arrival: arrival.id, barNamed: clicked, restT: rest.t, arrivalT: arrival.t, clickT: click.t, confirmT: named.t, cancelT: cancel.t, ackedT: acked.t, ackedId: acked.ackedId };
         save();
       }
+      if (!record.shift) throw new Error(`record: no shift in ${SHIFT_ATTEMPTS} attempts`);
 
       await sleep(20000);
       record.after = await page.evaluate(() => ({
@@ -310,7 +318,7 @@ async function take(browser, spec, url, { fake, main }) {
 
       // Ack under a shift: rest the pointer on the newest row's Ack, then click those same
       // screen coordinates just after the next incident lands on top.
-      for (let attempt = 1; attempt <= 3 && !record.shift; attempt += 1) {
+      for (let attempt = 1; attempt <= SHIFT_ATTEMPTS && !record.shift; attempt += 1) {
         const anchor = await nextArrival();
         await sleep(Math.max(0, REST_AFTER_ARRIVAL_MS - (at() - anchor.t)));
         const intended = await page.getByTestId('incident-row').first().getAttribute('data-id');
@@ -346,6 +354,7 @@ async function take(browser, spec, url, { fake, main }) {
         record.shift = { intended, restedOn, underPointer: underAtClick, ackedId: shiftAck?.id ?? null, arrival: arrival.id, restT: rest.t, arrivalT: arrival.t, clickT: click.t, ackedT: acked.t, footerOnScreen: click.footerOnScreen };
         save();
       }
+      if (!record.shift) throw new Error(`record: no shift in ${SHIFT_ATTEMPTS} attempts`);
 
       // Keep watching: arrivals continue, marks stay, no reload.
       await sleep(30000);

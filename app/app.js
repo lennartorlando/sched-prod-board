@@ -83,13 +83,16 @@ function ackedMark(at) {
 }
 
 // The action cell follows `acked`: an acked incident shows its mark, also when its row is
-// rebuilt. The row the confirm names stays outlined while the confirm is open.
+// rebuilt. The row the confirm names stays outlined while the confirm is open, and while an
+// ack is sending every row's Ack is disabled (one ack at a time, visibly).
 function syncAction(li, id) {
   const at = acked.get(id);
   li.classList.toggle('is-acked', at !== undefined);
   li.classList.toggle('is-confirming', pending?.id === id);
   const action = li.querySelector('.action');
   if (at !== undefined && !action.querySelector('[data-testid="acked"]')) action.replaceChildren(ackedMark(at));
+  const button = action.querySelector('[data-testid="ack"]');
+  if (button) button.disabled = Boolean(pending?.sending);
 }
 
 function updateRow(li, incident) {
@@ -141,54 +144,54 @@ const confirmAck = confirmBar.querySelector('[data-testid="confirm-ack"]');
 const confirmCancel = confirmBar.querySelector('[data-testid="confirm-cancel"]');
 let pending = null; // { id, sending }
 
-function outlineRows() {
-  for (const [id, li] of rows) li.classList.toggle('is-confirming', pending?.id === id);
+function syncRows() {
+  for (const [id, li] of rows) syncAction(li, id);
 }
 
 function openConfirm(li) {
-  if (pending?.sending) return; // one ack at a time
+  if (pending?.sending) return; // one ack at a time; the row Acks are disabled meanwhile
   const id = li.dataset.id;
   pending = { id, sending: false };
   confirmId.textContent = `Ack ${id}?`;
   confirmWhat.textContent = `${li.querySelector('.sev').textContent} · ${li.querySelector('.what').textContent}`;
   confirmError.textContent = '';
   confirmAck.textContent = `Ack ${id}`;
-  confirmAck.disabled = false;
-  confirmCancel.disabled = false;
   confirmBar.hidden = false;
-  document.body.classList.add('confirming');
-  outlineRows();
+  syncRows();
   confirmAck.focus({ preventScroll: true });
 }
 
 function closeConfirm() {
+  const id = pending?.id;
   pending = null;
   confirmBar.hidden = true;
-  document.body.classList.remove('confirming');
-  outlineRows();
+  syncRows();
+  // Focus goes back to the row's Ack; an acked row has none left, so focus stays put.
+  rows.get(id)?.querySelector('[data-testid="ack"]')?.focus({ preventScroll: true });
 }
 
+// While sending, the bar's buttons stay enabled and a click on them does nothing: a second
+// click is a no-op, not a wait on a disabled button. `aria-busy` and the label say it is sending.
 async function sendAck() {
   if (!pending || pending.sending) return;
   const { id } = pending;
   pending.sending = true;
-  confirmAck.disabled = true;
-  confirmCancel.disabled = true;
+  confirmBar.setAttribute('aria-busy', 'true');
   confirmAck.textContent = 'Acking…';
   confirmError.textContent = '';
+  syncRows();
   try {
     const reply = await ack(id);
     acked.set(id, reply.ackedAt ?? new Date().toISOString());
+    confirmBar.removeAttribute('aria-busy');
     closeConfirm();
-    const li = rows.get(id);
-    if (li) syncAction(li, id);
   } catch (error) {
     console.error(error);
     pending.sending = false;
-    confirmAck.disabled = false;
-    confirmCancel.disabled = false;
+    confirmBar.removeAttribute('aria-busy');
     confirmAck.textContent = `Ack ${id}`;
     confirmError.textContent = 'Ack failed. Try again.';
+    syncRows();
   }
 }
 
@@ -203,6 +206,8 @@ confirmCancel.addEventListener('click', () => {
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && pending && !pending.sending) closeConfirm();
+  // A held Enter opens the confirm and must not also press its Ack: only a fresh press confirms.
+  if (event.key === 'Enter' && event.repeat && pending) event.preventDefault();
 });
 
 // --- Loader and refresh (SCHED-4512, SCHED-4513) ----------------------------

@@ -24,5 +24,6 @@ footer .sha { font-family: ui-monospace, monospace; color: #1d1d1f; }
 .confirm .confirm-error { color: #ffb4b4; font-weight: 600; }
 .confirm button { font: inherit; padding: 4px 14px; border: 1px solid #fff; border-radius: 6px; background: transparent; color: #fff; cursor: pointer; }
 .confirm .confirm-ack { background: #fff; color: #1d1d1f; font-weight: 600; }
-.confirm button:disabled { opacity: 0.6; cursor: progress; }
-body.confirming { padding-bottom: 72px; }
+.confirm[aria-busy="true"] button { opacity: 0.6; cursor: progress; }
+/* Room for the bar, always: the page height never changes when it opens or closes, so rows do not jump. */
+body { padding-bottom: 72px; }
